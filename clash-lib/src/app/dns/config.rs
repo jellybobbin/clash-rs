@@ -6,7 +6,6 @@ use crate::{
     config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
 };
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
-use regex::Regex;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -14,6 +13,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
+use tracing::warn;
 use url::Url;
 pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
@@ -71,9 +71,20 @@ impl Config {
         for (i, server) in servers.iter().enumerate() {
             let mut server = server.clone();
 
-            if !server.contains("://") {
-                server = "udp://".to_owned() + &server;
+            if server == "system" {
+                warn!("'system' is not supported as dns nameserver, skipping");
+                continue;
             }
+
+            // If the server doesn't contain a scheme, assume it's a UDP address.
+            if !server.contains("://") {
+                if server.contains(':') && !server.starts_with('[') {
+                    server = format!("udp://[{}]", server);
+                } else {
+                    server = "udp://".to_owned() + &server;
+                }
+            }
+
             let url = Url::parse(&server).map_err(|_x| {
                 Error::InvalidConfig(format!(
                     "invalid dns server: {}",
@@ -81,7 +92,13 @@ impl Config {
                 ))
             })?;
 
-            let host = url.host_str().expect("dns host must be valid");
+            let host = url.host().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "invalid dns server: no host found in {}",
+                    server.as_str()
+                ))
+            })?;
+            let port = url.port();
 
             let iface = Self::parse_outbound_interface(&url);
             let proxy = Self::parse_outbound_proxy(&url);
@@ -90,25 +107,28 @@ impl Config {
 
             match url.scheme() {
                 "udp" => {
-                    addr = Config::host_with_default_port(host, "53")?;
+                    addr = Config::host_with_default_port(&host, port.unwrap_or(53));
                     net = "UDP";
                 }
                 "tcp" => {
-                    addr = Config::host_with_default_port(host, "53")?;
+                    addr = Config::host_with_default_port(&host, port.unwrap_or(53));
                     net = "TCP";
                 }
                 "tls" => {
-                    addr = Config::host_with_default_port(host, "853")?;
+                    addr =
+                        Config::host_with_default_port(&host, port.unwrap_or(853));
                     net = "DoT";
                 }
                 "https" => {
-                    addr = Config::host_with_default_port(host, "443")?;
+                    addr =
+                        Config::host_with_default_port(&host, port.unwrap_or(443));
                     net = "DoH";
                 }
                 "dhcp" => {
                     addr = host.to_string();
                     net = "DHCP";
                 }
+
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "DNS nameserver [{}] unsupported scheme: {}",
@@ -196,16 +216,28 @@ impl Config {
         Ok(tree)
     }
 
-    pub fn host_with_default_port(host: &str, port: &str) -> Result<String, Error> {
-        let has_port_suffix = Regex::new(r":\d+$").unwrap();
-
-        if has_port_suffix.is_match(host) {
-            Ok(host.into())
-        } else {
-            Ok(format!("{host}:{port}"))
+    pub fn host_with_default_port(host: &url::Host<&str>, port: u16) -> String {
+        match host {
+            url::Host::Domain(domain) => format!("{}:{}", domain, port),
+            url::Host::Ipv4(ipv4) => format!("{}:{}", ipv4, port),
+            url::Host::Ipv6(ipv6) => format!("[{}]:{}", ipv6, port),
         }
     }
+}
 
+fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
+    if addr.starts_with(':') {
+        format!("0.0.0.0{addr}").parse().map_err(|_| {
+            Error::InvalidConfig(format!("invalid dns listen address: {addr}"))
+        })
+    } else {
+        addr.parse().map_err(|_| {
+            Error::InvalidConfig(format!("invalid dns listen address: {addr}"))
+        })
+    }
+}
+
+impl Config {
     pub fn parse_outbound_proxy(url: &Url) -> Option<String> {
         let frag = url.fragment()?;
         let pairs = frag.split("&");
@@ -291,11 +323,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 .clone()
                 .map(|l| match l {
                     DNSListen::Udp(u) => {
-                        let addr = u.parse::<SocketAddr>().map_err(|_| {
-                            Error::InvalidConfig(format!(
-                                "invalid dns udp listen address: {u}"
-                            ))
-                        })?;
+                        let addr = parse_listen_addr(&u)?;
                         Ok(DNSListenAddr {
                             udp: Some(addr),
                             ..Default::default()
@@ -316,13 +344,8 @@ impl TryFrom<&crate::config::def::Config> for Config {
                                         .ok_or(Error::InvalidConfig(format!(
                                             "invalid udp dns listen address - must \
                                              be string: {v:?}"
-                                        )))?
-                                        .parse::<SocketAddr>()
-                                        .map_err(|_| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dns listen address: {v:?}"
-                                            ))
-                                        })?;
+                                        )))
+                                        .and_then(parse_listen_addr)?;
                                     udp = Some(addr)
                                 }
                                 "tcp" => {
@@ -331,13 +354,8 @@ impl TryFrom<&crate::config::def::Config> for Config {
                                         .ok_or(Error::InvalidConfig(format!(
                                             "invalid tcp dns listen address - must \
                                              be string: {v:?}"
-                                        )))?
-                                        .parse::<SocketAddr>()
-                                        .map_err(|_| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dns listen address: {v:?}"
-                                            ))
-                                        })?;
+                                        )))
+                                        .and_then(parse_listen_addr)?;
                                     tcp = Some(addr)
                                 }
                                 "doh" => {
@@ -460,5 +478,36 @@ impl From<crate::config::def::FallbackFilter> for FallbackFilter {
             ip_cidr: ipcidr.ok(),
             domain: c.domain,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nameserver_ipv6_without_scheme() {
+        let servers = vec!["2400:3200::1".to_string()];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].address, "[2400:3200::1]:53");
+        assert_eq!(ns[0].net, DNSNetMode::Udp);
+        let _sock: std::net::SocketAddr = ns[0]
+            .address
+            .parse()
+            .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn parse_nameserver_ipv6_with_brackets_and_port() {
+        let servers = vec!["[2400:3200::1]:5353".to_string()];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].address, "[2400:3200::1]:5353");
+        assert_eq!(ns[0].net, DNSNetMode::Udp);
+        let _sock: std::net::SocketAddr = ns[0]
+            .address
+            .parse()
+            .expect("address should parse to SocketAddr");
     }
 }
