@@ -1,6 +1,9 @@
 verify:
   cargo run -p clash-rs -- -t
 
+run:
+  cargo run -p clash-rs -- -c config.yaml
+
 fmt:
   cargo +nightly fmt
 
@@ -12,3 +15,8 @@ docs:
 
 test-no-docker:
   CLASH_RS_CI=true cargo test --all --all-features
+
+verge:
+  cargo build -p clash-rs --release --features=standard
+  rm -f "C:\Program Files\Clash Verge\verge-mihomo-alpha.exe"
+  cp target/release/clash-rs.exe "C:\Program Files\Clash Verge\verge-mihomo-alpha.exe"
